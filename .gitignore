@@ -1,3 +1,14 @@
 depot_tools/
 .cipd/
 v8/
+**/__pycache__
+cv8.o
+cv8.obj
+libcv8.a
+cv8.lib
+libv8_monolith.a
+v8_monolith.lib
+libv8_libbase.a
+libv8_libplatform.a
+libv8_libcxx.a
+libv8_libcxxabi.a
