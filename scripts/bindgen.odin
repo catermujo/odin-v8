@@ -1,5 +1,7 @@
+#+feature dynamic-literals
 package main
 
+import "base:runtime"
 import "core:fmt"
 import ast "core:odin/ast"
 import parser "core:odin/parser"
@@ -131,19 +133,8 @@ sanitize_identifier :: proc(raw: string) -> string {
 }
 
 mode_suffix :: proc(mode: Binding_Mode) -> string {
-    switch mode {
-    case .stub:
-        return "stub"
-    case .void:
-        return "void"
-    case .bool:
-        return "bool"
-    case .utf8:
-        return "utf8"
-    case .rgba4:
-        return "rgba4"
-    }
-    return "stub"
+    #no_type_assert e := runtime.type_info_base(type_info_of(Binding_Mode)).variant.(runtime.Type_Info_Enum)
+    return e.names[mode]
 }
 
 quote_odin_string :: proc(raw: string) -> string {
@@ -175,13 +166,10 @@ to_pascal_identifier :: proc(raw: string) -> string {
     return string(out[:])
 }
 
-join2 :: proc(a, b: string) -> (string, bool) {
-    parts := [2]string{a, b}
-    joined, err := filepath.join(parts[:])
-    if err != nil {
-        return "", false
-    }
-    return joined, true
+join2 :: proc(a, b: string) -> string {
+    joined, err := filepath.join({a, b})
+    ensure(err == nil)
+    return joined
 }
 
 resolve_module_path :: proc(lib_arg: string) -> (module_abs, module_name: string, ok: bool) {
@@ -728,7 +716,7 @@ ensure_named_ts_type :: proc(name: string, ts_ctx: ^TS_Render_Context) -> string
     ts_ctx.resolving_named[name] = true
 
     expr := ""
-    if guessed, ok := ts_guess_named_type(name); ok {
+    if guessed, guess_ok := ts_guess_named_type(name); guess_ok {
         expr = guessed
     } else if def, ok := ts_ctx.named_defs[name]; ok {
         switch def.kind {
@@ -775,6 +763,35 @@ ensure_named_ts_type :: proc(name: string, ts_ctx: ^TS_Render_Context) -> string
     return alias_name
 }
 
+ODIN_TO_TS: map[string]string = {
+    "bool"          = "boolean",
+    "string"        = "string",
+    "cstring"       = "string",
+    "rawptr"        = "JscOpaqueHandle<\"rawptr\"> | null",
+    "byte"          = "number",
+    "rune"          = "number",
+    "i8"            = "number",
+    "i16"           = "number",
+    "i32"           = "number",
+    "i64"           = "number",
+    "i128"          = "number",
+    "int"           = "number",
+    "u8"            = "number",
+    "u16"           = "number",
+    "u32"           = "number",
+    "u64"           = "number",
+    "u128"          = "number",
+    "uint"          = "number",
+    "uintptr"       = "number",
+    "f16"           = "number",
+    "f32"           = "number",
+    "f64"           = "number",
+    "complex64"     = "number",
+    "complex128"    = "number",
+    "quaternion128" = "number",
+    "quaternion256" = "number",
+}
+
 map_odin_type_to_ts :: proc(odin_type: string, ts_ctx: ^TS_Render_Context) -> string {
     t := compact_type_text(strings.trim_space(odin_type))
     if t == "" {
@@ -788,33 +805,8 @@ map_odin_type_to_ts :: proc(odin_type: string, ts_ctx: ^TS_Render_Context) -> st
         }
     }
 
-    if t == "bool" do return "boolean"
-    if t == "string" || t == "cstring" do return "string"
-    if t == "rawptr" do return "JscOpaqueHandle<\"rawptr\"> | null"
-
-    if t == "byte" ||
-       t == "rune" ||
-       t == "i8" ||
-       t == "i16" ||
-       t == "i32" ||
-       t == "i64" ||
-       t == "i128" ||
-       t == "int" ||
-       t == "u8" ||
-       t == "u16" ||
-       t == "u32" ||
-       t == "u64" ||
-       t == "u128" ||
-       t == "uint" ||
-       t == "uintptr" ||
-       t == "f16" ||
-       t == "f32" ||
-       t == "f64" ||
-       t == "complex64" ||
-       t == "complex128" ||
-       t == "quaternion128" ||
-       t == "quaternion256" {
-        return "number"
+    if ot, ok := ODIN_TO_TS[t]; ok {
+        return ot
     }
 
     if strings.has_prefix(t, "^") {
@@ -867,9 +859,6 @@ map_odin_type_to_ts :: proc(odin_type: string, ts_ctx: ^TS_Render_Context) -> st
     if strings.has_prefix(t, "proc") || contains_substring(t, "#typeproc") {
         return "(...args: unknown[]) => unknown"
     }
-    if strings.has_prefix(t, "any") || contains_substring(t, "Type_Info") {
-        return "unknown"
-    }
     if strings.has_prefix(t, "struct{") {
         return "JscObject"
     }
@@ -886,6 +875,9 @@ map_odin_type_to_ts :: proc(odin_type: string, ts_ctx: ^TS_Render_Context) -> st
         return ensure_named_ts_type(t, ts_ctx)
     }
 
+    if strings.has_prefix(t, "any") || contains_substring(t, "Type_Info") {
+        return "unknown"
+    }
     return "unknown"
 }
 
@@ -1361,11 +1353,7 @@ parse_spec_file :: proc(module_abs: string) -> (spec: Spec_Config, ok: bool) {
     spec.renames = make(map[string]string)
     spec.specializes = make([dynamic]Specialize_Directive)
 
-    spec_abs, joined := join2(module_abs, SPEC_FILE_NAME)
-    if !joined {
-        fmt.eprintln("v8_bindgen: failed to allocate spec path")
-        return spec, false
-    }
+    spec_abs := join2(module_abs, SPEC_FILE_NAME)
 
     if !os.exists(spec_abs) {
         return spec, true
@@ -2106,16 +2094,8 @@ run :: proc() -> int {
         return 1
     }
 
-    output_abs, output_ok := join2(module_abs, GEN_FILE_NAME)
-    if !output_ok {
-        fmt.eprintln("v8_bindgen: failed to allocate output path")
-        return 1
-    }
-    output_dts_abs, output_dts_ok := join2(module_abs, GEN_DTS_FILE_NAME)
-    if !output_dts_ok {
-        fmt.eprintln("v8_bindgen: failed to allocate d.ts output path")
-        return 1
-    }
+    output_abs := join2(module_abs, GEN_FILE_NAME)
+    output_dts_abs := join2(module_abs, GEN_DTS_FILE_NAME)
 
     spec, spec_ok := parse_spec_file(module_abs)
     if !spec_ok {
