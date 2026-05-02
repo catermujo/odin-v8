@@ -1,5 +1,6 @@
 package v8
 
+import runtime "base:runtime"
 import "core:c"
 import "core:fmt"
 import "core:strings"
@@ -128,12 +129,67 @@ v8_quote_js_string_literal :: proc(raw: string) -> string {
     return fmt.aprintf("'%s'", escaped, allocator = context.temp_allocator)
 }
 
+V8_RUNTIME_CONSOLE_LOG_SYMBOL :: cstring("__odin_v8_console_log")
+
+// DUMBAI: host callback backs `console.log` so JS scripts can emit diagnostics through Odin stdout.
+v8_runtime_console_log_callback :: proc "c" (arg0_utf8: cstring, user_data: rawptr) {
+    _ = user_data
+    context = runtime.default_context()
+    if arg0_utf8 == nil {
+        fmt.println("")
+        return
+    }
+    fmt.println(arg0_utf8)
+}
+
+install_console_log_and_require :: proc(isolate: Isolate, ctx: Context) -> bool {
+    // DUMBAI: bootstrap `console.log` against an Odin callback because bare V8 contexts do not ship host IO APIs.
+    if !bind_utf8_function(isolate, ctx, V8_RUNTIME_CONSOLE_LOG_SYMBOL, v8_runtime_console_log_callback) {
+        return false
+    }
+
+    bootstrap := strings.builder_make()
+    strings.write_string(&bootstrap, "(function(){const __root=globalThis;")
+    strings.write_string(
+        &bootstrap,
+        "const __console=(typeof __root.console==='object'&&__root.console!==null)?__root.console:(__root.console=Object.create(null));",
+    )
+    strings.write_string(
+        &bootstrap,
+        "if(typeof __console.log!=='function'){__console.log=(...__args)=>{const __sink=__root.__odin_v8_console_log;if(typeof __sink==='function'){__sink(__args.map((__v)=>String(__v)).join(' '));}};}",
+    )
+    strings.write_string(
+        &bootstrap,
+        "if(typeof __root.require!=='function'){__root.require=(__spec)=>{if(typeof __spec!=='string'){throw new TypeError('require(path) expects a string');}const __trimmed=__spec.trim();if(!__trimmed){throw new Error('require(path) received an empty specifier');}const __normalized=__trimmed.replace(/^\\.\\//,'').replace(/\\.js$/,'').replace(/\\//g,'.');const __parts=__normalized.split('.').filter(Boolean);let __node=__root;for(const __part of __parts){if(__node==null||((typeof __node!=='object')&&(typeof __node!=='function'))||!(__part in __node)){throw new Error(`Cannot require '${__spec}'`);}__node=__node[__part];}return __node;};}",
+    )
+    strings.write_string(&bootstrap, "})();")
+
+    source := strings.to_string(bootstrap)
+    source_utf8, cerr := strings.clone_to_cstring(source, context.temp_allocator)
+    if cerr != nil {
+        return false
+    }
+
+    // DUMBAI: evaluate helper bootstrap once per bind call so all generated module contexts share same JS helper surface.
+    err: Error
+    if run_script_utf8(isolate, ctx, source_utf8, cstring("v8_runtime_helpers.js"), &err, nil, 0, nil) == 0 {
+        return false
+    }
+
+    return true
+}
+
 bind_global_functions_into_namespace :: proc(
     isolate: Isolate,
     ctx: Context,
     namespace: string,
     function_names: []string,
 ) -> bool {
+    // DUMBAI: install runtime helpers up front so scripts can use console logging + module lookup before module calls.
+    if !install_console_log_and_require(isolate, ctx) {
+        return false
+    }
+
     if len(function_names) == 0 {
         return true
     }
