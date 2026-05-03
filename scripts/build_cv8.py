@@ -17,6 +17,8 @@ LinkMode = Literal["shared", "static"]
 ROOT = Path(__file__).resolve().parents[1]
 V8_SOURCE = ROOT / "v8"
 DEPOT_TOOLS = ROOT / "depot_tools"
+V8_SOURCE_URL = "https://chromium.googlesource.com/v8/v8.git"
+V8_SOURCE_BRANCH = "main"
 
 
 @dataclass(frozen=True)
@@ -197,13 +199,31 @@ def _ensure_depot_tools() -> None:
 
 
 def _ensure_v8_source() -> None:
-    if V8_SOURCE.exists():
-        return
+    if not V8_SOURCE.exists():
+        # DUMBAI: clone V8 source as a shallow checkout so first-run bootstrap
+        # remains bandwidth-friendly on CI and local developer machines.
+        _run(
+            [
+                "git",
+                "clone",
+                "--depth=1",
+                "--single-branch",
+                "--branch",
+                V8_SOURCE_BRANCH,
+                V8_SOURCE_URL,
+                str(V8_SOURCE),
+            ],
+            cwd=ROOT,
+        )
+
     if not (ROOT / ".gclient").exists():
-        msg = f"Missing .gclient in {ROOT}; cannot bootstrap V8 source checkout."
-        raise FileNotFoundError(msg)
-    # DUMBAI: bootstrap missing V8 checkout from vendored .gclient so first-run
-    # environments can build without manual fetch steps.
+        if not V8_SOURCE.exists():
+            msg = f"Missing .gclient in {ROOT}; cannot bootstrap V8 dependency sync."
+            raise FileNotFoundError(msg)
+        return
+
+    # DUMBAI: sync dependency graph with no-history mode so third-party repos
+    # stay shallow while still matching the configured .gclient solution pins.
     _run([_depot_tool("gclient"), "sync", "--no-history"], cwd=ROOT)
     if not V8_SOURCE.exists():
         msg = f"Expected V8 source checkout not found after sync: {V8_SOURCE}"
