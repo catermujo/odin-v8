@@ -44,10 +44,118 @@ def _run(args: list[str], *, cwd: Path) -> None:
     cmd = " ".join(shlex.quote(part) for part in args)
     print(f"[build_cv8] $ {cmd}  (cwd={cwd})")
     env = os.environ.copy()
+    if _is_windows():
+        # DUMBAI: prefer local VS toolchain on Windows so depot_tools does not
+        # require authenticated downloads from Chromium's toolchain bucket.
+        env.setdefault("DEPOT_TOOLS_WIN_TOOLCHAIN", "0")
     if DEPOT_TOOLS.exists():
         # DUMBAI: keep depot_tools first on PATH so gn/autoninja resolve predictably for V8 builds.
         env["PATH"] = f"{DEPOT_TOOLS}{os.pathsep}{env.get('PATH', '')}"
     subprocess.run(args, cwd=cwd, check=True, env=env)
+
+
+def _depot_tool(tool: str) -> str:
+    if _is_windows():
+        bat = DEPOT_TOOLS / f"{tool}.bat"
+        if bat.exists():
+            return str(bat)
+    return str(DEPOT_TOOLS / tool)
+
+
+def _resolve_windows_tool(
+    tool_name: str,
+    *,
+    fallback_names: tuple[str, ...] = (),
+) -> str | None:
+    resolved = shutil.which(tool_name)
+    if resolved is not None:
+        return resolved
+
+    for fallback in fallback_names:
+        resolved = shutil.which(fallback)
+        if resolved is not None:
+            return resolved
+
+    local_tool_bins = (
+        V8_SOURCE / "third_party" / "llvm-build" / "Release+Asserts" / "bin",
+    )
+    names = (tool_name, *fallback_names)
+    for bin_dir in local_tool_bins:
+        if not bin_dir.exists():
+            continue
+        for name in names:
+            candidate = bin_dir / name
+            if candidate.exists():
+                return str(candidate)
+
+    search_roots = [
+        Path(os.environ.get("ProgramFiles", "C:\\Program Files")),
+        Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")),
+    ]
+    candidates: list[Path] = []
+    for root in search_roots:
+        vs_root = root / "Microsoft Visual Studio"
+        if not vs_root.exists():
+            continue
+        for name in names:
+            candidates.extend(
+                vs_root.glob(
+                    f"*/*/VC/Tools/MSVC/*/bin/Hostx64/x64/{name}",
+                )
+            )
+
+    if not candidates:
+        return None
+
+    # DUMBAI: prefer the newest discovered MSVC tool binary so hosts with
+    # multiple VS installs use the latest available compiler/linker.
+    selected = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    return str(selected)
+
+
+def _resolve_vcvarsall(tool_path: str) -> Path | None:
+    path = Path(tool_path)
+    for parent in path.parents:
+        if parent.name != "VC":
+            continue
+        candidate = parent / "Auxiliary" / "Build" / "vcvarsall.bat"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _run_windows_with_vcvars(command: list[str], *, tool_path: str) -> None:
+    vcvarsall = _resolve_vcvarsall(tool_path)
+    if vcvarsall is None and _is_windows():
+        msvc_cl = _resolve_windows_tool("cl.exe")
+        if msvc_cl is not None:
+            vcvarsall = _resolve_vcvarsall(msvc_cl)
+    if vcvarsall is None:
+        _run(command, cwd=ROOT)
+        return
+
+    target_cmd = subprocess.list2cmdline(command)
+    # DUMBAI: run through a temporary batch file to avoid cmd.exe quoting edge
+    # cases with long absolute paths containing spaces.
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".bat",
+        delete=False,
+        dir=ROOT,
+        encoding="utf-8",
+        newline="\r\n",
+    ) as bat_file:
+        bat_path = Path(bat_file.name)
+        bat_file.write("@echo off\n")
+        bat_file.write(f'call "{vcvarsall}" x64 >nul\n')
+        bat_file.write("if errorlevel 1 exit /b %errorlevel%\n")
+        bat_file.write(f"{target_cmd}\n")
+        bat_file.write("exit /b %errorlevel%\n")
+
+    try:
+        _run(["cmd", "/c", str(bat_path)], cwd=ROOT)
+    finally:
+        bat_path.unlink(missing_ok=True)
 
 
 def _remove_path(path: Path) -> None:
@@ -80,8 +188,38 @@ def _ensure_depot_tools() -> None:
 
     bootstrap_marker = DEPOT_TOOLS / "python3_bin_reldir.txt"
     if cloned or not bootstrap_marker.exists():
-        # DUMBAI: ensure_bootstrap initializes cipd-managed depot_tools runtime (gn/autoninja wrappers rely on this).
-        _run([str(DEPOT_TOOLS / "ensure_bootstrap")], cwd=DEPOT_TOOLS)
+        if _is_windows():
+            # DUMBAI: ensure_bootstrap is bash-only; Windows bootstrap uses the batch updater.
+            _run([str(DEPOT_TOOLS / "update_depot_tools.bat")], cwd=DEPOT_TOOLS)
+        else:
+            # DUMBAI: ensure_bootstrap initializes cipd-managed depot_tools runtime on Unix hosts.
+            _run([str(DEPOT_TOOLS / "ensure_bootstrap")], cwd=DEPOT_TOOLS)
+
+
+def _ensure_v8_source() -> None:
+    if V8_SOURCE.exists():
+        return
+    if not (ROOT / ".gclient").exists():
+        msg = f"Missing .gclient in {ROOT}; cannot bootstrap V8 source checkout."
+        raise FileNotFoundError(msg)
+    # DUMBAI: bootstrap missing V8 checkout from vendored .gclient so first-run
+    # environments can build without manual fetch steps.
+    _run([_depot_tool("gclient"), "sync", "--no-history"], cwd=ROOT)
+    if not V8_SOURCE.exists():
+        msg = f"Expected V8 source checkout not found after sync: {V8_SOURCE}"
+        raise FileNotFoundError(msg)
+
+
+def _ensure_v8_build_metadata() -> None:
+    lastchange = V8_SOURCE / "build" / "util" / "LASTCHANGE.committime"
+    if lastchange.exists():
+        return
+    # DUMBAI: regenerate V8 metadata hooks when LASTCHANGE is missing so GN
+    # timestamp scripts can run in freshly synced checkouts.
+    _run([_depot_tool("gclient"), "sync", "--no-history"], cwd=ROOT)
+    if not lastchange.exists():
+        msg = f"Missing V8 metadata after sync: {lastchange}"
+        raise FileNotFoundError(msg)
 
 
 def _gn_binary() -> Path:
@@ -294,7 +432,13 @@ def _build_v8_outputs(
             pass
 
     _ensure_depot_tools()
+    _ensure_v8_source()
+    _ensure_v8_build_metadata()
     gn = _gn_binary()
+    if not gn.exists():
+        # DUMBAI: recover from partial checkouts by forcing a sync before
+        # failing on missing GN tool binaries.
+        _run([_depot_tool("gclient"), "sync", "--no-history"], cwd=ROOT)
     if not gn.exists():
         msg = f"Expected gn binary not found: {gn}"
         raise FileNotFoundError(msg)
@@ -304,12 +448,13 @@ def _build_v8_outputs(
     # DUMBAI: call gn + autoninja directly so we build only requested targets instead of broader gm flows.
     _run([str(gn), "gen", f"out/{gn_out}"], cwd=V8_SOURCE)
 
-    autoninja = DEPOT_TOOLS / "autoninja"
-    if not autoninja.exists():
-        msg = f"Expected autoninja not found: {autoninja}"
-        raise FileNotFoundError(msg)
     _run(
-        [str(autoninja), "-C", f"out/{gn_out}", *_build_targets(link_mode=link_mode)],
+        [
+            _depot_tool("autoninja"),
+            "-C",
+            f"out/{gn_out}",
+            *_build_targets(link_mode=link_mode),
+        ],
         cwd=V8_SOURCE,
     )
     return _resolve_v8_outputs(gn_out=gn_out, link_mode=link_mode)
@@ -384,10 +529,17 @@ def _archive_member_count(path: Path) -> int:
 
 def _stage_static_support_libs(*, gn_out: str) -> list[Path]:
     obj_root = V8_SOURCE / "out" / gn_out / "obj"
-    staged_pairs: list[tuple[Path, Path]] = [
-        (obj_root / "libv8_libbase.a", ROOT / "libv8_libbase.a"),
-        (obj_root / "libv8_libplatform.a", ROOT / "libv8_libplatform.a"),
-    ]
+    if _is_windows():
+        # DUMBAI: Chromium's Windows static outputs are .lib files without lib* prefixes.
+        staged_pairs: list[tuple[Path, Path]] = [
+            (obj_root / "v8_libbase.lib", ROOT / "v8_libbase.lib"),
+            (obj_root / "v8_libplatform.lib", ROOT / "v8_libplatform.lib"),
+        ]
+    else:
+        staged_pairs = [
+            (obj_root / "libv8_libbase.a", ROOT / "libv8_libbase.a"),
+            (obj_root / "libv8_libplatform.a", ROOT / "libv8_libplatform.a"),
+        ]
     if _is_darwin():
         staged_pairs.extend(
             [
@@ -525,14 +677,16 @@ def _build_cv8_shim(
         return cv8_lib
 
     if _is_windows():
-        if shutil.which("cl") is None:
-            msg = "Missing MSVC cl. Run from a Developer Command Prompt."
+        compiler = _resolve_windows_tool("clang-cl.exe", fallback_names=("cl.exe",))
+        if compiler is None:
+            msg = "Missing Windows C/C++ compiler. Install VS C++ tools or expose cl/clang-cl on PATH."
             raise RuntimeError(msg)
 
         compile_cmd = [
-            "cl",
+            compiler,
             "/nologo",
             "/std:c++20",
+            "/Zc:__cplusplus",
             "/O2",
             "/EHsc",
             "/I",
@@ -543,21 +697,26 @@ def _build_cv8_shim(
             "cv8.cc",
             f"/Fo{cv8_obj.name}",
         ]
-        _run(compile_cmd, cwd=ROOT)
+        _run_windows_with_vcvars(compile_cmd, tool_path=compiler)
 
         if link_mode == "static":
-            if shutil.which("lib") is None:
-                msg = "Missing MSVC lib.exe. Run from a Developer Command Prompt."
+            archiver = _resolve_windows_tool("llvm-lib.exe", fallback_names=("lib.exe",))
+            if archiver is None:
+                msg = "Missing Windows librarian. Install VS C++ tools or expose lib/llvm-lib on PATH."
                 raise RuntimeError(msg)
-            _run(["lib", "/nologo", f"/OUT:{cv8_lib.name}", cv8_obj.name], cwd=ROOT)
+            _run_windows_with_vcvars(
+                [archiver, "/nologo", f"/OUT:{cv8_lib.name}", cv8_obj.name],
+                tool_path=archiver,
+            )
         else:
-            if shutil.which("link") is None:
-                msg = "Missing MSVC link.exe. Run from a Developer Command Prompt."
+            linker = _resolve_windows_tool("lld-link.exe", fallback_names=("link.exe",))
+            if linker is None:
+                msg = "Missing Windows linker. Install VS C++ tools or expose link/lld-link on PATH."
                 raise RuntimeError(msg)
             # DUMBAI: shared mode links cv8.dll against V8 import libs so executables avoid static monolith linkage.
-            _run(
+            _run_windows_with_vcvars(
                 [
-                    "link",
+                    linker,
                     "/nologo",
                     "/DLL",
                     f"/OUT:{cv8_lib.name}",
@@ -565,7 +724,7 @@ def _build_cv8_shim(
                     cv8_obj.name,
                     *[str(path) for path in v8_link_inputs],
                 ],
-                cwd=ROOT,
+                tool_path=linker,
             )
     else:
         cxx = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++")
@@ -661,6 +820,8 @@ def _cleanup_artifacts(*, clean_all: bool) -> None:
         "v8_monolith.lib",
         "libv8_libbase.a",
         "libv8_libplatform.a",
+        "v8_libbase.lib",
+        "v8_libplatform.lib",
         "libv8_libcxx.a",
         "libv8_libcxxabi.a",
         "libv8.so",
