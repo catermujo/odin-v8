@@ -397,6 +397,22 @@ def _resolve_v8_outputs(*, gn_out: str, link_mode: LinkMode) -> V8Outputs:
                 )
                 raise FileNotFoundError(msg)
             link_inputs.append(link_path)
+        libcxx_link: Path | None = None
+        for candidate in _shared_windows_link_name_candidates("libc++"):
+            try:
+                libcxx_link = _find_output_artifact(out_dir=out_dir, name=candidate)
+                break
+            except FileNotFoundError:
+                continue
+        if libcxx_link is None:
+            msg = (
+                "Expected libc++ import library not found for shared build target "
+                f"libc++ in {out_dir}"
+            )
+            raise FileNotFoundError(msg)
+        # DUMBAI: shared cv8 uses Chromium's libc++ ABI namespace (__Cr), so
+        # link against the matching libc++.dll import library.
+        link_inputs.append(libcxx_link)
     else:
         # DUMBAI: Unix shared linking can consume staged dylib/so files directly.
         link_inputs = list(runtime)
@@ -689,10 +705,18 @@ def _build_cv8_shim(
             "/Zc:__cplusplus",
             "/O2",
             "/EHsc",
+            # DUMBAI: keep cv8 compiled against Chromium's libc++ ABI namespace
+            # so shared-mode symbols match V8 DLL exports on Windows.
+            "/D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
+            "/D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS",
             "/I",
             "v8",
             "/I",
             "v8\\include",
+            "/I",
+            "v8\\buildtools\\third_party\\libc++",
+            "/I",
+            "v8\\third_party\\libc++\\src\\include",
             "/c",
             "cv8.cc",
             f"/Fo{cv8_obj.name}",
